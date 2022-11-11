@@ -27,7 +27,7 @@ import (
 
 // a key-value store backed by raft
 type kvstore struct {
-	proposeC    chan<- string // channel for proposing updates
+	proposeC    chan<- proposal // channel for proposing updates
 	mu          sync.RWMutex
 	kvStore     map[string]string // current committed key-value pairs
 	snapshotter *snap.Snapshotter
@@ -38,7 +38,7 @@ type kv struct {
 	Val string
 }
 
-func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
+func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- proposal, commitC <-chan *commit, errorC <-chan error) *kvstore {
 	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
 	snapshot, err := s.loadSnapshot()
 	if err != nil {
@@ -62,12 +62,20 @@ func (s *kvstore) Lookup(key string) (string, bool) {
 	return v, ok
 }
 
-func (s *kvstore) Propose(k string, v string) {
+func (s *kvstore) Propose(k string, v string, wait bool) error {
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
 		log.Fatal(err)
 	}
-	s.proposeC <- buf.String()
+
+	if wait {
+		done := make(chan error)
+		s.proposeC <- proposal{Message: buf.String(), done: done}
+		return <-done
+	} else {
+		s.proposeC <- proposal{Message: buf.String(), done: nil}
+		return nil
+	}
 }
 
 func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {

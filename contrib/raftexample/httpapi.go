@@ -19,6 +19,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
@@ -28,6 +29,8 @@ type httpKVAPI struct {
 	store       *kvstore
 	confChangeC chan<- raftpb.ConfChange
 }
+
+const waitPrefix = "/wait"
 
 func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key := r.RequestURI
@@ -41,7 +44,17 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		h.store.Propose(key, string(v))
+		wait := false
+		if strings.HasPrefix(key, waitPrefix+"/") {
+			key = key[len(waitPrefix):]
+			wait = true
+		}
+
+		if err := h.store.Propose(key, string(v), wait); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(err.Error()))
+			return
+		}
 
 		// Optimistic-- no waiting for ack from raft. Value is not yet
 		// committed so a subsequent GET on the key may return old value

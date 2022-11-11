@@ -41,7 +41,7 @@ func main() {
 		peers[pid] = pinfo[1]
 	}
 
-	proposeC := make(chan string)
+	proposeC := make(chan proposal)
 	defer close(proposeC)
 	confChangeC := make(chan raftpb.ConfChange)
 	defer close(confChangeC)

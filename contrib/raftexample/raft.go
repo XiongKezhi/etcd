@@ -15,8 +15,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"fmt"
+	"go.etcd.io/etcd/pkg/v3/idutil"
+	"go.etcd.io/etcd/pkg/v3/wait"
 	"log"
 	"net/http"
 	"net/url"
@@ -37,23 +41,48 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	TickMs        = 100 // the number of milliseconds between heartbeat ticks
+	ElectionTick  = 10  // a multiple of TickMs
+	HeartbeatTick = 1   // a multiple of TickMs
+)
+
 type commit struct {
 	data       []string
 	applyDoneC chan<- struct{}
 }
 
+// A proposal received from upper application layer
+type proposal struct {
+	Id      uint64       // attached by raftNode, users should not use this field
+	Message string       // a message the user wants to propose
+	done    chan<- error // if this field not nil, meaning the user waits on commit
+}
+
+func (p *proposal) marshall() ([]byte, error) {
+	var buf bytes.Buffer
+	err := gob.NewEncoder(&buf).Encode(p)
+	return buf.Bytes(), err
+}
+
+func (p *proposal) unmarshall(data []byte) error {
+	return gob.NewDecoder(bytes.NewBuffer(data)).Decode(p)
+}
+
 // A key-value stream backed by raft
 type raftNode struct {
-	proposeC    <-chan string            // proposed messages (k,v)
+	proposeC    <-chan proposal          // proposed messages (k,v)
 	confChangeC <-chan raftpb.ConfChange // proposed cluster config changes
 	commitC     chan<- *commit           // entries committed to log (k,v)
 	errorC      chan<- error             // errors from raft session
+	wait        wait.Wait                // proposals waiting on commit
 
-	id          int            // client ID for raft session
-	peers       map[int]string // raft peer URLs
-	join        bool           // node is joining an existing cluster
-	waldir      string         // path to WAL directory
-	snapdir     string         // path to snapshot directory
+	id          int               // client ID for raft session
+	propIdGen   *idutil.Generator // id generator for proposal
+	peers       map[int]string          // raft peer URLs
+	join        bool              // node is joining an existing cluster
+	waldir      string            // path to WAL directory
+	snapdir     string            // path to snapshot directory
 	getSnapshot func() ([]byte, error)
 
 	confState     raftpb.ConfState
@@ -84,7 +113,7 @@ var defaultSnapshotCount uint64 = 10000
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(id int, peers map[int]string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
+func newRaftNode(id int, peers map[int]string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan proposal,
 	confChangeC <-chan raftpb.ConfChange) (<-chan *commit, <-chan error, <-chan *snap.Snapshotter) {
 
 	commitC := make(chan *commit)
@@ -95,7 +124,9 @@ func newRaftNode(id int, peers map[int]string, join bool, getSnapshot func() ([]
 		confChangeC: confChangeC,
 		commitC:     commitC,
 		errorC:      errorC,
+		wait:        wait.New(),
 		id:          id,
+		propIdGen:   idutil.NewGenerator(uint16(id), time.Now()),
 		peers:       peers,
 		join:        join,
 		waldir:      fmt.Sprintf("raftexample-%d", id),
@@ -155,6 +186,7 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 	}
 
 	data := make([]string, 0, len(ents))
+	waitIds := make([]uint64, 0, len(ents))
 	for i := range ents {
 		switch ents[i].Type {
 		case raftpb.EntryNormal:
@@ -162,8 +194,13 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 				// ignore empty messages
 				break
 			}
-			s := string(ents[i].Data)
-			data = append(data, s)
+
+			var prop proposal
+			prop.unmarshall(ents[i].Data)
+			data = append(data, prop.Message)
+			if prop.Id != 0 {
+				waitIds = append(waitIds, prop.Id)
+			}
 		case raftpb.EntryConfChange:
 			var cc raftpb.ConfChange
 			cc.Unmarshal(ents[i].Data)
@@ -196,6 +233,11 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 
 	// after commit, update appliedIndex
 	rc.appliedIndex = ents[len(ents)-1].Index
+
+	// trigger waiting proposers
+	for _, id := range waitIds {
+		rc.wait.Trigger(id, nil)
+	}
 
 	return applyDoneC, true
 }
@@ -291,8 +333,8 @@ func (rc *raftNode) startRaft() {
 	}
 	c := &raft.Config{
 		ID:                        uint64(rc.id),
-		ElectionTick:              10,
-		HeartbeatTick:             1,
+		ElectionTick:              ElectionTick,
+		HeartbeatTick:             HeartbeatTick,
 		Storage:                   rc.raftStorage,
 		MaxSizePerMsg:             1024 * 1024,
 		MaxInflightMsgs:           256,
@@ -410,7 +452,7 @@ func (rc *raftNode) serveChannels() {
 
 	defer rc.wal.Close()
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(TickMs * time.Millisecond)
 	defer ticker.Stop()
 
 	// send proposals over raft
@@ -422,11 +464,42 @@ func (rc *raftNode) serveChannels() {
 			case prop, ok := <-rc.proposeC:
 				if !ok {
 					rc.proposeC = nil
-				} else {
-					// blocks until accepted by raft state machine
-					rc.node.Propose(context.TODO(), []byte(prop))
 				}
 
+				if prop.done == nil {
+					data, err := prop.marshall()
+					if err == nil {
+						rc.node.Propose(context.TODO(), data)
+					}
+				} else {
+					prop.Id = rc.propIdGen.Next()
+					waitC := rc.wait.Register(prop.Id)
+
+					data, err := prop.marshall()
+					if err != nil {
+						prop.done <- err
+						continue
+					}
+
+					ctx, cancel := context.WithTimeout(context.Background(),
+						// this formula for timeout refers etcd/server/config/config.go:310
+						5*time.Second+2*time.Duration(ElectionTick*int(TickMs))*time.Millisecond)
+					if err := rc.node.Propose(ctx, data); err != nil {
+						prop.done <- err
+						cancel()
+						continue
+					}
+
+					select {
+					case <-waitC:
+						prop.done <- nil
+					case <-ctx.Done():
+						prop.done <- ctx.Err()
+					}
+
+					rc.wait.Trigger(prop.Id, nil) // clear up
+					cancel()                      // cancel to avoid leak
+				}
 			case cc, ok := <-rc.confChangeC:
 				if !ok {
 					rc.confChangeC = nil
