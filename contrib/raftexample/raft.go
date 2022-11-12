@@ -49,11 +49,11 @@ type raftNode struct {
 	commitC     chan<- *commit           // entries committed to log (k,v)
 	errorC      chan<- error             // errors from raft session
 
-	id          int      // client ID for raft session
-	peers       []string // raft peer URLs
-	join        bool     // node is joining an existing cluster
-	waldir      string   // path to WAL directory
-	snapdir     string   // path to snapshot directory
+	id          int            // client ID for raft session
+	peers       map[int]string // raft peer URLs
+	join        bool           // node is joining an existing cluster
+	waldir      string         // path to WAL directory
+	snapdir     string         // path to snapshot directory
 	getSnapshot func() ([]byte, error)
 
 	confState     raftpb.ConfState
@@ -84,7 +84,7 @@ var defaultSnapshotCount uint64 = 10000
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
+func newRaftNode(id int, peers map[int]string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
 	confChangeC <-chan raftpb.ConfChange) (<-chan *commit, <-chan error, <-chan *snap.Snapshotter) {
 
 	commitC := make(chan *commit)
@@ -285,9 +285,9 @@ func (rc *raftNode) startRaft() {
 	// signal replay has finished
 	rc.snapshotterReady <- rc.snapshotter
 
-	rpeers := make([]raft.Peer, len(rc.peers))
-	for i := range rpeers {
-		rpeers[i] = raft.Peer{ID: uint64(i + 1)}
+	rpeers := make([]raft.Peer, 0, len(rc.peers))
+	for id := range rc.peers {
+		rpeers = append(rpeers, raft.Peer{ID: uint64(id)})
 	}
 	c := &raft.Config{
 		ID:                        uint64(rc.id),
@@ -316,9 +316,9 @@ func (rc *raftNode) startRaft() {
 	}
 
 	rc.transport.Start()
-	for i := range rc.peers {
-		if i+1 != rc.id {
-			rc.transport.AddPeer(types.ID(i+1), []string{rc.peers[i]})
+	for pid, purl := range rc.peers {
+		if pid != rc.id {
+			rc.transport.AddPeer(types.ID(pid), []string{purl})
 		}
 	}
 
@@ -477,7 +477,7 @@ func (rc *raftNode) serveChannels() {
 }
 
 func (rc *raftNode) serveRaft() {
-	url, err := url.Parse(rc.peers[rc.id-1])
+	url, err := url.Parse(rc.peers[rc.id])
 	if err != nil {
 		log.Fatalf("raftexample: Failed parsing URL (%v)", err)
 	}
