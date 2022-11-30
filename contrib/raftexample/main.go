@@ -20,14 +20,13 @@ import (
 	"log"
 	"strconv"
 	"strings"
-
-	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 func main() {
 	cluster := flag.String("cluster", "1=http://127.0.0.1:9021", "comma separated cluster peers, each in format id=url")
 	id := flag.Int("id", 1, "node ID")
 	kvport := flag.Int("port", 9121, "key-value server port")
+	mergePort := flag.Int("mergeport", 9122, "merge server port")
 	join := flag.Bool("join", false, "join an existing cluster")
 	flag.Parse()
 
@@ -43,16 +42,30 @@ func main() {
 
 	proposeC := make(chan proposal)
 	defer close(proposeC)
-	confChangeC := make(chan raftpb.ConfChange)
+	mergeProposeC := make(chan proposal)
+	defer close(mergeProposeC)
+	confChangeC := make(chan confChangeProposal)
 	defer close(confChangeC)
 
 	// raft provides a commit stream for the proposals from the http api
 	var kvs *kvstore
 	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
-	commitC, errorC, snapshotterReady := newRaftNode(*id, peers, *join, getSnapshot, proposeC, confChangeC)
+	rc, commitC, mergeCommitC, errorC, snapshotterReady :=
+		newRaftNode(*id, peers, *join, getSnapshot, proposeC, mergeProposeC, confChangeC)
 
 	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
 
+	mr := newMerger(rc, NewMergeStore(kvs, proposeC), uint32(*kvport),
+		mergeProposeC, confChangeC, mergeCommitC, errorC)
+
 	// the key-value http handler will propose updates to raft
-	serveHttpKVAPI(kvs, *kvport, confChangeC, errorC)
+	serveHttpKVAPI(kvs, mr, *kvport, confChangeC)
+
+	// the merge rpc server will server merge related calls
+	serveRpcMergeAPI(rc, *mergePort, mergeProposeC)
+
+	// exit when raft goes down
+	if err, ok := <-errorC; ok {
+		log.Fatal(err)
+	}
 }

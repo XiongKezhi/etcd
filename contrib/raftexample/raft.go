@@ -15,12 +15,11 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/gob"
 	"fmt"
 	"go.etcd.io/etcd/pkg/v3/idutil"
 	"go.etcd.io/etcd/pkg/v3/wait"
+	"go.etcd.io/etcd/v3/contrib/raftexample/mergepb"
 	"log"
 	"net/http"
 	"net/url"
@@ -54,32 +53,43 @@ type commit struct {
 
 // A proposal received from upper application layer
 type proposal struct {
-	Id      uint64       // attached by raftNode, users should not use this field
+	Id      uint64       // used by raftNode to register a proposal and notify after committed
 	Message string       // a message the user wants to propose
-	done    chan<- error // if this field not nil, meaning the user waits on commit
+	wait    chan<- error // if this field not nil, meaning the user waits on commit
 }
 
 func (p *proposal) marshall() ([]byte, error) {
-	var buf bytes.Buffer
-	err := gob.NewEncoder(&buf).Encode(p)
-	return buf.Bytes(), err
+	pp := mergepb.Proposal{Id: p.Id, Message: p.Message}
+	return pp.Marshal()
 }
 
 func (p *proposal) unmarshall(data []byte) error {
-	return gob.NewDecoder(bytes.NewBuffer(data)).Decode(p)
+	var pp mergepb.Proposal
+	if err := pp.Unmarshal(data); err != nil {
+		return err
+	}
+	p.Id, p.Message = pp.Id, pp.Message
+	return nil
+}
+
+type confChangeProposal struct {
+	cc   raftpb.ConfChange
+	wait chan<- error
 }
 
 // A key-value stream backed by raft
 type raftNode struct {
-	proposeC    <-chan proposal          // proposed messages (k,v)
-	confChangeC <-chan raftpb.ConfChange // proposed cluster config changes
-	commitC     chan<- *commit           // entries committed to log (k,v)
-	errorC      chan<- error             // errors from raft session
-	wait        wait.Wait                // proposals waiting on commit
+	proposeC      <-chan proposal           // proposed messages (k,v)
+	mergeProposeC <-chan proposal           // proposed merge related messages
+	confChangeC   <-chan confChangeProposal // proposed cluster config changes
+	commitC       chan<- *commit            // entries committed to log (k,v)
+	mergeCommitC  chan<- *commit            // entries committed to merger
+	errorC        chan<- error              // errors from raft session
+	wait          wait.Wait                 // proposals waiting on commit
 
 	id          int               // client ID for raft session
 	propIdGen   *idutil.Generator // id generator for proposal
-	peers       map[int]string          // raft peer URLs
+	peers       map[int]string    // raft peer URLs
 	join        bool              // node is joining an existing cluster
 	waldir      string            // path to WAL directory
 	snapdir     string            // path to snapshot directory
@@ -113,29 +123,33 @@ var defaultSnapshotCount uint64 = 10000
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(id int, peers map[int]string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan proposal,
-	confChangeC <-chan raftpb.ConfChange) (<-chan *commit, <-chan error, <-chan *snap.Snapshotter) {
+func newRaftNode(id int, peers map[int]string, join bool, getSnapshot func() ([]byte, error),
+	proposeC <-chan proposal, mergeProposeC <-chan proposal, confChangeC <-chan confChangeProposal) (
+	*raftNode, chan *commit, chan *commit, <-chan error, <-chan *snap.Snapshotter) {
 
 	commitC := make(chan *commit)
+	mergeCommitC := make(chan *commit)
 	errorC := make(chan error)
 
 	rc := &raftNode{
-		proposeC:    proposeC,
-		confChangeC: confChangeC,
-		commitC:     commitC,
-		errorC:      errorC,
-		wait:        wait.New(),
-		id:          id,
-		propIdGen:   idutil.NewGenerator(uint16(id), time.Now()),
-		peers:       peers,
-		join:        join,
-		waldir:      fmt.Sprintf("raftexample-%d", id),
-		snapdir:     fmt.Sprintf("raftexample-%d-snap", id),
-		getSnapshot: getSnapshot,
-		snapCount:   defaultSnapshotCount,
-		stopc:       make(chan struct{}),
-		httpstopc:   make(chan struct{}),
-		httpdonec:   make(chan struct{}),
+		proposeC:      proposeC,
+		mergeProposeC: mergeProposeC,
+		confChangeC:   confChangeC,
+		commitC:       commitC,
+		mergeCommitC:  mergeCommitC,
+		errorC:        errorC,
+		wait:          wait.New(),
+		id:            id,
+		propIdGen:     idutil.NewGenerator(uint16(id), time.Now()),
+		peers:         peers,
+		join:          join,
+		waldir:        fmt.Sprintf("raftexample-%d", id),
+		snapdir:       fmt.Sprintf("raftexample-%d-snap", id),
+		getSnapshot:   getSnapshot,
+		snapCount:     defaultSnapshotCount,
+		stopc:         make(chan struct{}),
+		httpstopc:     make(chan struct{}),
+		httpdonec:     make(chan struct{}),
 
 		logger: zap.NewExample(),
 
@@ -143,7 +157,65 @@ func newRaftNode(id int, peers map[int]string, join bool, getSnapshot func() ([]
 		// rest of structure populated after WAL replay
 	}
 	go rc.startRaft()
-	return commitC, errorC, rc.snapshotterReady
+	return rc, commitC, mergeCommitC, errorC, rc.snapshotterReady
+}
+
+func (rc *raftNode) clear() error {
+	// clear communication channels with peers
+	rc.join = false
+	rc.peers = make(map[int]string)
+	rc.node.Stop()
+	rc.transport.RemoveAllPeers()
+
+	// clear up raft state
+	rc.confState = raftpb.ConfState{}
+	rc.snapshotIndex = 0
+	rc.appliedIndex = 0
+
+	// clear up WAL, logs, and snapshots
+	rc.raftStorage = nil
+	if err := rc.wal.Close(); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(rc.waldir); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(rc.snapdir); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// refresh the node to a new one to join another cluster
+func (rc *raftNode) refresh(peers map[int]string) error {
+	if err := rc.clear(); err != nil {
+		return err
+	}
+
+	rc.wal = rc.replayWAL()
+
+	rc.join = true
+	rc.peers = peers
+	c := &raft.Config{
+		ID:                        uint64(rc.id),
+		ElectionTick:              ElectionTick,
+		HeartbeatTick:             HeartbeatTick,
+		Storage:                   rc.raftStorage,
+		MaxSizePerMsg:             1024 * 1024,
+		MaxInflightMsgs:           256,
+		MaxUncommittedEntriesSize: 1 << 30,
+	}
+	rc.node = raft.RestartNode(c)
+
+	for pid, purl := range rc.peers {
+		if pid != rc.id {
+			rc.transport.AddPeer(types.ID(pid), []string{purl})
+		}
+	}
+
+	redirect("")
+	return nil
 }
 
 func (rc *raftNode) saveSnap(snap raftpb.Snapshot) error {
@@ -170,7 +242,7 @@ func (rc *raftNode) entriesToApply(ents []raftpb.Entry) (nents []raftpb.Entry) {
 	}
 	firstIdx := ents[0].Index
 	if firstIdx > rc.appliedIndex+1 {
-		log.Fatalf("first index of committed entry[%d] should <= progress.appliedIndex[%d]+1", firstIdx, rc.appliedIndex)
+		log.Fatalf("first index of committed entry[%d] should <= getStatus.appliedIndex[%d]+1", firstIdx, rc.appliedIndex)
 	}
 	if rc.appliedIndex-firstIdx+1 < uint64(len(ents)) {
 		nents = ents[rc.appliedIndex-firstIdx+1:]
@@ -180,12 +252,13 @@ func (rc *raftNode) entriesToApply(ents []raftpb.Entry) (nents []raftpb.Entry) {
 
 // publishEntries writes committed log entries to commit channel and returns
 // whether all entries could be published.
-func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) {
+func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 	if len(ents) == 0 {
-		return nil, true
+		return true
 	}
 
-	data := make([]string, 0, len(ents))
+	kvData := make([]string, 0, len(ents))
+	mergeData := make([]string, 0, len(ents))
 	waitIds := make([]uint64, 0, len(ents))
 	for i := range ents {
 		switch ents[i].Type {
@@ -197,7 +270,14 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 
 			var prop proposal
 			prop.unmarshall(ents[i].Data)
-			data = append(data, prop.Message)
+			kvData = append(kvData, prop.Message)
+			if prop.Id != 0 {
+				waitIds = append(waitIds, prop.Id)
+			}
+		case raftpb.EntryMerge:
+			var prop proposal
+			prop.unmarshall(ents[i].Data)
+			mergeData = append(mergeData, prop.Message)
 			if prop.Id != 0 {
 				waitIds = append(waitIds, prop.Id)
 			}
@@ -213,21 +293,49 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 			case raftpb.ConfChangeRemoveNode:
 				if cc.NodeID == uint64(rc.id) {
 					log.Println("I've been removed from the cluster! Shutting down.")
-					return nil, false
+					return false
 				}
 				rc.transport.RemovePeer(types.ID(cc.NodeID))
 			}
+			rc.wait.Trigger(cc.ID, nil)
 		}
 	}
 
-	var applyDoneC chan struct{}
-
-	if len(data) > 0 {
-		applyDoneC = make(chan struct{}, 1)
+	var applyKvDoneC chan struct{}
+	if len(kvData) > 0 {
+		applyKvDoneC := make(chan struct{}, 1)
 		select {
-		case rc.commitC <- &commit{data, applyDoneC}:
+		case rc.commitC <- &commit{kvData, applyKvDoneC}:
+			break
 		case <-rc.stopc:
-			return nil, false
+			return false
+		}
+	}
+
+	var applyMergeDoneC chan struct{}
+	if len(mergeData) > 0 {
+		applyMergeDoneC = make(chan struct{}, 1)
+		select {
+		case rc.mergeCommitC <- &commit{mergeData, applyMergeDoneC}:
+			break
+		case <-rc.stopc:
+			return false
+		}
+	}
+
+	if applyKvDoneC != nil {
+		select {
+		case <-applyKvDoneC:
+		case <-rc.stopc:
+			return false
+		}
+	}
+
+	if applyMergeDoneC != nil {
+		select {
+		case <-applyMergeDoneC:
+		case <-rc.stopc:
+			return false
 		}
 	}
 
@@ -239,7 +347,7 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 		rc.wait.Trigger(id, nil)
 	}
 
-	return applyDoneC, true
+	return true
 }
 
 func (rc *raftNode) loadSnapshot() *raftpb.Snapshot {
@@ -308,6 +416,7 @@ func (rc *raftNode) replayWAL() *wal.WAL {
 func (rc *raftNode) writeError(err error) {
 	rc.stopHTTP()
 	close(rc.commitC)
+	close(rc.mergeCommitC)
 	rc.errorC <- err
 	close(rc.errorC)
 	rc.node.Stop()
@@ -391,7 +500,7 @@ func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 	defer log.Printf("finished publishing snapshot at index %d", rc.snapshotIndex)
 
 	if snapshotToSave.Metadata.Index <= rc.appliedIndex {
-		log.Fatalf("snapshot index [%d] should > progress.appliedIndex [%d]", snapshotToSave.Metadata.Index, rc.appliedIndex)
+		log.Fatalf("snapshot index [%d] should > getStatus.appliedIndex [%d]", snapshotToSave.Metadata.Index, rc.appliedIndex)
 	}
 	rc.commitC <- nil // trigger kvstore to load snapshot
 
@@ -402,20 +511,15 @@ func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 
 var snapshotCatchUpEntriesN uint64 = 10000
 
-func (rc *raftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
+func (rc *raftNode) maybeTriggerSnapshot() {
 	if rc.appliedIndex-rc.snapshotIndex <= rc.snapCount {
 		return
 	}
 
-	// wait until all committed entries are applied (or server is closed)
-	if applyDoneC != nil {
-		select {
-		case <-applyDoneC:
-		case <-rc.stopc:
-			return
-		}
-	}
+	rc.triggerSnapshot()
+}
 
+func (rc *raftNode) triggerSnapshot() raftpb.Snapshot {
 	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", rc.appliedIndex, rc.snapshotIndex)
 	data, err := rc.getSnapshot()
 	if err != nil {
@@ -439,6 +543,8 @@ func (rc *raftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
 
 	log.Printf("compacted log at index %d", compactIndex)
 	rc.snapshotIndex = rc.appliedIndex
+
+	return snap
 }
 
 func (rc *raftNode) serveChannels() {
@@ -457,8 +563,6 @@ func (rc *raftNode) serveChannels() {
 
 	// send proposals over raft
 	go func() {
-		confChangeCount := uint64(0)
-
 		for rc.proposeC != nil && rc.confChangeC != nil {
 			select {
 			case prop, ok := <-rc.proposeC:
@@ -466,7 +570,7 @@ func (rc *raftNode) serveChannels() {
 					rc.proposeC = nil
 				}
 
-				if prop.done == nil {
+				if prop.wait == nil {
 					data, err := prop.marshall()
 					if err == nil {
 						rc.node.Propose(context.TODO(), data)
@@ -477,7 +581,7 @@ func (rc *raftNode) serveChannels() {
 
 					data, err := prop.marshall()
 					if err != nil {
-						prop.done <- err
+						prop.wait <- err
 						continue
 					}
 
@@ -485,28 +589,79 @@ func (rc *raftNode) serveChannels() {
 						// this formula for timeout refers etcd/server/config/config.go:310
 						5*time.Second+2*time.Duration(ElectionTick*int(TickMs))*time.Millisecond)
 					if err := rc.node.Propose(ctx, data); err != nil {
-						prop.done <- err
+						prop.wait <- err
 						cancel()
 						continue
 					}
 
 					select {
 					case <-waitC:
-						prop.done <- nil
+						prop.wait <- nil
+						cancel()
 					case <-ctx.Done():
-						prop.done <- ctx.Err()
+						prop.wait <- ctx.Err()
+						rc.wait.Trigger(prop.Id, nil) // clear up
 					}
-
-					rc.wait.Trigger(prop.Id, nil) // clear up
-					cancel()                      // cancel to avoid leak
 				}
-			case cc, ok := <-rc.confChangeC:
+			case prop, ok := <-rc.mergeProposeC:
+				if !ok || prop.wait == nil {
+					rc.mergeProposeC = nil
+				}
+
+				prop.Id = rc.propIdGen.Next()
+				waitC := rc.wait.Register(prop.Id)
+
+				data, err := prop.marshall()
+				if err != nil {
+					prop.wait <- err
+					continue
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(),
+					// this formula for timeout refers etcd/server/config/config.go:310
+					5*time.Second+2*time.Duration(ElectionTick*int(TickMs))*time.Millisecond)
+				if err := rc.node.ProposeMerge(ctx, data); err != nil {
+					prop.wait <- err
+					cancel()
+					continue
+				}
+
+				select {
+				case <-waitC:
+					prop.wait <- nil
+					cancel()
+				case <-ctx.Done():
+					prop.wait <- ctx.Err()
+					rc.wait.Trigger(prop.Id, nil) // clear up
+				}
+			case prop, ok := <-rc.confChangeC:
 				if !ok {
 					rc.confChangeC = nil
 				} else {
-					confChangeCount++
-					cc.ID = confChangeCount
-					rc.node.ProposeConfChange(context.TODO(), cc)
+					if prop.wait == nil {
+						rc.node.ProposeConfChange(context.TODO(), prop.cc)
+					} else {
+						prop.cc.ID = rc.propIdGen.Next()
+						waitC := rc.wait.Register(prop.cc.ID)
+
+						ctx, cancel := context.WithTimeout(context.Background(),
+							// this formula for timeout refers etcd/server/config/config.go:310
+							5*time.Second+2*time.Duration(ElectionTick*int(TickMs))*time.Millisecond)
+						if err := rc.node.ProposeConfChange(ctx, prop.cc); err != nil {
+							prop.wait <- err
+							cancel()
+							continue
+						}
+
+						select {
+						case <-waitC:
+							prop.wait <- nil
+							cancel()
+						case <-ctx.Done():
+							prop.wait <- ctx.Err()
+							rc.wait.Trigger(prop.cc.ID, nil) // clear up
+						}
+					}
 				}
 			}
 		}
@@ -530,12 +685,11 @@ func (rc *raftNode) serveChannels() {
 			}
 			rc.raftStorage.Append(rd.Entries)
 			rc.transport.Send(rd.Messages)
-			applyDoneC, ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries))
-			if !ok {
+			if !rc.publishEntries(rc.entriesToApply(rd.CommittedEntries)) {
 				rc.stop()
 				return
 			}
-			rc.maybeTriggerSnapshot(applyDoneC)
+			rc.maybeTriggerSnapshot()
 			rc.node.Advance()
 
 		case err := <-rc.transport.ErrorC:
