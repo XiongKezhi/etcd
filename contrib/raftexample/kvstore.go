@@ -55,6 +55,12 @@ func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- proposal, commitC
 	return s
 }
 
+func (s *kvstore) Put(k string, v string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kvStore[k] = v
+}
+
 func (s *kvstore) Lookup(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -70,10 +76,10 @@ func (s *kvstore) Propose(k string, v string, wait bool) error {
 
 	if wait {
 		done := make(chan error)
-		s.proposeC <- proposal{Message: buf.String(), done: done}
+		s.proposeC <- proposal{Message: buf.String(), wait: done}
 		return <-done
 	} else {
-		s.proposeC <- proposal{Message: buf.String(), done: nil}
+		s.proposeC <- proposal{Message: buf.String(), wait: nil}
 		return nil
 	}
 }

@@ -145,6 +145,9 @@ type Node interface {
 	// version of this library aware of the V2 API. See pb.ConfChangeV2 for
 	// usage details and semantics.
 	ProposeConfChange(ctx context.Context, cc pb.ConfChangeI) error
+	// ProposeMerge proposes a merge request. The data should contain enough information on
+	// clusters and identifier of the request.
+	ProposeMerge(ctx context.Context, data []byte) error
 
 	// Step advances the state machine using the given message. ctx.Err() will be returned, if any.
 	Step(ctx context.Context, msg pb.Message) error
@@ -419,6 +422,10 @@ func (n *node) Campaign(ctx context.Context) error { return n.step(ctx, pb.Messa
 
 func (n *node) Propose(ctx context.Context, data []byte) error {
 	return n.stepWait(ctx, pb.Message{Type: pb.MsgProp, Entries: []pb.Entry{{Data: data}}})
+}
+
+func (n *node) ProposeMerge(ctx context.Context, data []byte) error {
+	return n.stepWait(ctx, pb.Message{Type: pb.MsgProp, Entries: []pb.Entry{{Type: pb.EntryMerge, Data: data}}})
 }
 
 func (n *node) Step(ctx context.Context, m pb.Message) error {

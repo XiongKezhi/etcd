@@ -296,6 +296,10 @@ func (t *Transport) AddPeer(id types.ID, us []string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if id == t.ID {
+		return
+	}
+
 	if t.peers == nil {
 		panic("transport stopped")
 	}

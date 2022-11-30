@@ -1,0 +1,82 @@
+// compile: protoc -I=$GOPATH/src/go.etcd.io/etcd/contrib/raftexample/mergepb -I=$GOPATH/pkg/mod/github.com/gogo/protobuf@v1.3.2 --gogo_out=$GOPATH/src --go-grpc_out=$GOPATH/src merge.proto
+syntax = "proto2";
+package mergepb;
+
+option go_package = "go.etcd.io/etcd/contrib/raftexample/mergepb";
+import "gogoproto/gogo.proto";
+
+option (gogoproto.marshaler_all) = true;
+option (gogoproto.sizer_all) = true;
+option (gogoproto.unmarshaler_all) = true;
+option (gogoproto.goproto_getters_all) = false;
+option (gogoproto.goproto_enum_prefix_all) = false;
+option (gogoproto.goproto_unkeyed_all) = false;
+option (gogoproto.goproto_unrecognized_all) = false;
+option (gogoproto.goproto_sizecache_all) = false;
+
+message Proposal {
+  required uint64 Id 			= 1 [(gogoproto.nullable) = false];
+  required string Message = 2 [(gogoproto.nullable) = false];
+}
+
+enum MergeMessageType {
+  MergeNew          = 0;
+  MergeSquashLog    = 1;
+  MergeRefreshed    = 2;
+  MergeRedirect     = 3;
+}
+
+message Node {
+  required string Ip 				= 1 [(gogoproto.nullable) = false];
+  required uint32 MergePort	= 2 [(gogoproto.nullable) = false];
+  required uint32 RaftPort 	= 3 [(gogoproto.nullable) = false];
+}
+
+message Cluster {
+  map<uint64, Node> Nodes = 1 [(gogoproto.nullable) = false];
+}
+
+message MergeMessage {
+  // required by all messages
+  required uint64 Id					   = 1 [(gogoproto.nullable) = false]; // id of the merge process
+  required MergeMessageType Type = 2 [(gogoproto.nullable) = false];
+
+  // required by MergeNew
+  repeated Cluster Clusters   = 3 [(gogoproto.nullable) = false];
+
+  // required by MergeSquashLog
+  optional uint64 ClusterIdx  = 4 [(gogoproto.nullable) = false];
+  optional uint64 NextIdx     = 5 [(gogoproto.nullable) = false];
+  optional bool   LastBatch   = 6 [(gogoproto.nullable) = false];
+  repeated bytes  Logs        = 7;
+
+  // required by MergeRefreshed
+  optional uint64 NodeId      = 8 [(gogoproto.nullable) = false];
+
+  // required by MergeRedirect
+  optional string RedirectIp  = 9 [(gogoproto.nullable) = false];
+  optional uint32 RedirectPort= 10 [(gogoproto.nullable) = false];
+}
+
+message LogRequest {
+  required uint64 Id     = 1 [(gogoproto.nullable) = false]; // id of the merge process
+  required uint64 Index  = 2 [(gogoproto.nullable) = false]; // start index of desired logs
+  required uint32 KvPort = 3 [(gogoproto.nullable) = false]; // kv port of the requesting server
+}
+
+message LogResponse {
+  repeated bytes  Logs      = 1;   // a batch of logs, each log only contains the data part of a pb.Entry
+  optional bool   LastBatch = 2 [(gogoproto.nullable) = false]; // true if this is the last batch
+}
+
+message RefreshRequest {
+  required uint64     RequesterId = 1 [(gogoproto.nullable) = false]; // id of the requester node, debug usage
+  map<uint64, string> Peers       = 2 [(gogoproto.nullable) = false]; // nodes of the coordinator cluster
+}
+
+message RefreshResponse {}
+
+service Merge {
+  rpc GetLogs(LogRequest) returns (LogResponse) {}
+  rpc Refresh(RefreshRequest) returns (RefreshResponse) {}
+}

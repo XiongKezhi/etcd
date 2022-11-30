@@ -44,7 +44,7 @@ type cluster struct {
 	snapshotTriggeredC []<-chan struct{}
 }
 
-// newCluster creates a cluster of n nodes
+// newCluster creates a cluster of n Nodes
 func newCluster(n int) *cluster {
 	peers := make([]string, n)
 	for i := range peers {
@@ -73,7 +73,7 @@ func newCluster(n int) *cluster {
 	return clus
 }
 
-// Close closes all cluster nodes and returns an error if any failed.
+// Close closes all cluster Nodes and returns an error if any failed.
 func (clus *cluster) Close() (err error) {
 	for i := range clus.peers {
 		go func(i int) {
@@ -101,8 +101,8 @@ func (clus *cluster) closeNoErrors(t *testing.T) {
 	t.Log("closing cluster [done]")
 }
 
-// TestProposeOnCommit starts three nodes and feeds commits back into the proposal
-// channel. The intent is to ensure blocking on a proposal won't block raft progress.
+// TestProposeOnCommit starts three Nodes and feeds commits back into the proposal
+// channel. The intent is to ensure blocking on a proposal won't block raft getStatus.
 func TestProposeOnCommit(t *testing.T) {
 	clus := newCluster(3)
 	defer clus.closeNoErrors(t)
@@ -125,8 +125,8 @@ func TestProposeOnCommit(t *testing.T) {
 			}
 			donec <- struct{}{}
 			for range cC {
-				// acknowledge the commits from other nodes so
-				// raft continues to make progress
+				// acknowledge the commits from other Nodes so
+				// raft continues to make getStatus
 			}
 		}(clus.proposeC[i], clus.commitC[i], clus.errorC[i])
 
