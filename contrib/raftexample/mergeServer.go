@@ -43,8 +43,20 @@ func (m *mergeServer) GetLogs(ctx context.Context, in *mergepb.LogRequest) (*mer
 	// get all following logs, shouldn't be performance problem since the method returns a slice (a reference)
 	ents, err := m.rc.raftStorage.Entries(in.Index, m.rc.node.Status().Commit+1, maxSize)
 	if err != nil {
+		// if requested logs are compacted, send a snapshot of application data
 		if err == raft.ErrCompacted {
-			// TODO: send snapshot
+			nextIdx, err := m.rc.raftStorage.FirstIndex()
+			if err != nil {
+				log.Printf("Fetch first index failed: %v", err)
+			}
+			log.Printf("Send snapshot for compacted logs before %v", nextIdx)
+
+			snapshot, err := m.rc.getSnapshot()
+			if err != nil {
+				log.Printf("Fetch snapshot failed: %v", err)
+			}
+
+			return &mergepb.LogResponse{Snapshot: snapshot, NextIdx: nextIdx, LastBatch: false}, nil
 		}
 
 		log.Printf("Fetch entries failed: %v", err)

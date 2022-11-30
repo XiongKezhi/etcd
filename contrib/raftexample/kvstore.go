@@ -105,7 +105,18 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 			var dataKv kv
 			dec := gob.NewDecoder(bytes.NewBufferString(data))
 			if err := dec.Decode(&dataKv); err != nil {
-				log.Fatalf("raftexample: could not decode message (%v)", err)
+				// try unmarshal as snapshot since it may come from merge
+				var store map[string]string
+				if err = json.Unmarshal([]byte(data), &store); err != nil {
+					log.Fatalf("raftexample: could not decode message (%v)", err)
+				}
+
+				for k, v := range store {
+					s.mu.Lock()
+					s.kvStore[k] = v
+					s.mu.Unlock()
+				}
+				continue
 			}
 			s.mu.Lock()
 			s.kvStore[dataKv.Key] = dataKv.Val

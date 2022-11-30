@@ -133,26 +133,45 @@ func (m *merger) applySquashLog(msg mergepb.MergeMessage) {
 	}
 }
 
+func (m *merger) mergeSnapshot(msg mergepb.MergeMessage) {
+	// commit data to kv store
+	log.Printf("Apply snapshot before index %v on cluster #%v", msg.NextIdx, msg.ClusterIdx)
+	applyDoneC := make(chan struct{})
+	m.rc.commitC <- &commit{[]string{string(msg.Snapshot)}, applyDoneC}
+	select {
+	case <-applyDoneC:
+	case <-m.rc.stopc:
+		return
+	}
+}
+
 func (m *merger) handleSquashLog(msg mergepb.MergeMessage) {
 	mst, ok := m.ms.get(msg.Id, false)
 	if !ok {
 		panic(ok)
 	}
 
-	// different Nodes may propose the same squash log entry concurrently,
-	// we only apply each squash log once
+	// expected next index from squash log
 	nextIdx := mst.NextIndexes[msg.ClusterIdx]
-	if nextIdx == 0 {
+	if nextIdx == 0 { // already finished
 		return
 	}
 
 	if len(msg.Logs) != 0 {
+		// different Nodes may propose the same squash log entry concurrently,
+		// we only apply each squash log once
 		if nextIdx >= msg.NextIdx {
 			return
 		}
 
 		m.applySquashLog(msg)
-	}
+	} else if len(msg.Snapshot) != 0 {
+		if nextIdx >= msg.NextIdx {
+			return
+		}
+
+		m.mergeSnapshot(msg)
+	} // else: the candidate cluster has no data at all
 
 	// update progress
 	log.Printf("Update cluster #%v's progress from %v to %v", msg.ClusterIdx, nextIdx, msg.NextIdx)
@@ -285,10 +304,16 @@ func (m *merger) startPullingLogs(kvPort uint32, mid uint64, clusters []mergepb.
 					Id:         mid,
 					Type:       mergepb.MergeSquashLog,
 					ClusterIdx: idx,
-					NextIdx:    progress + uint64(len(resp.Logs)),
 					LastBatch:  resp.LastBatch,
-					Logs:       resp.Logs,
 				}
+				if len(resp.Logs) != 0 {
+					msg.Logs = resp.Logs
+					msg.NextIdx = progress + uint64(len(resp.Logs))
+				} else if len(resp.Snapshot) != 0 {
+					msg.Snapshot = resp.Snapshot
+					msg.NextIdx = resp.NextIdx
+				}
+
 				buf, err := msg.Marshal()
 				if err != nil {
 					log.Printf("Marshal proposal message failed: %v", err)
