@@ -11,7 +11,7 @@ import (
 type mergeStage int
 
 const (
-	NONE mergeStage = iota
+	NONE mergeStage = iota // NONE will only exist when candidate
 	Pulling
 	Refreshing
 	COMPLETED
@@ -39,6 +39,10 @@ type mergeState struct {
 }
 
 func (s *mergeState) stage() mergeStage {
+	if s.Clusters == nil || s.NextIndexes == nil || s.Merged == nil {
+		return NONE
+	}
+
 	cnt := 0
 	for i := range s.NextIndexes {
 		if s.NextIndexes[i] == 0 {
@@ -107,8 +111,11 @@ func (s *mergeStore) setOngoingId(id uint64) {
 	s.store.Put(MergeOngoingId, strconv.FormatUint(id, 10))
 }
 
-func (s *mergeStore) getOngoingId() (uint64, bool) {
-	s.mustPropose(MergeNop, MergeNop)
+func (s *mergeStore) getOngoingId(quorum bool) (uint64, bool) {
+	if quorum {
+		s.mustPropose(MergeNop, MergeNop)
+	}
+
 	v, ok := s.store.Lookup(MergeOngoingId)
 	if !ok {
 		return 0, false

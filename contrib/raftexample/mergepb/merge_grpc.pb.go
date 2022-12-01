@@ -22,6 +22,7 @@ const _ = grpc.SupportPackageIsVersion7
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type MergeClient interface {
+	Try(ctx context.Context, in *TryRequest, opts ...grpc.CallOption) (*TryResponse, error)
 	GetLogs(ctx context.Context, in *LogRequest, opts ...grpc.CallOption) (*LogResponse, error)
 	Refresh(ctx context.Context, in *RefreshRequest, opts ...grpc.CallOption) (*RefreshResponse, error)
 }
@@ -32,6 +33,15 @@ type mergeClient struct {
 
 func NewMergeClient(cc grpc.ClientConnInterface) MergeClient {
 	return &mergeClient{cc}
+}
+
+func (c *mergeClient) Try(ctx context.Context, in *TryRequest, opts ...grpc.CallOption) (*TryResponse, error) {
+	out := new(TryResponse)
+	err := c.cc.Invoke(ctx, "/mergepb.Merge/Try", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *mergeClient) GetLogs(ctx context.Context, in *LogRequest, opts ...grpc.CallOption) (*LogResponse, error) {
@@ -56,6 +66,7 @@ func (c *mergeClient) Refresh(ctx context.Context, in *RefreshRequest, opts ...g
 // All implementations must embed UnimplementedMergeServer
 // for forward compatibility
 type MergeServer interface {
+	Try(context.Context, *TryRequest) (*TryResponse, error)
 	GetLogs(context.Context, *LogRequest) (*LogResponse, error)
 	Refresh(context.Context, *RefreshRequest) (*RefreshResponse, error)
 	mustEmbedUnimplementedMergeServer()
@@ -65,6 +76,9 @@ type MergeServer interface {
 type UnimplementedMergeServer struct {
 }
 
+func (UnimplementedMergeServer) Try(context.Context, *TryRequest) (*TryResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Try not implemented")
+}
 func (UnimplementedMergeServer) GetLogs(context.Context, *LogRequest) (*LogResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetLogs not implemented")
 }
@@ -82,6 +96,24 @@ type UnsafeMergeServer interface {
 
 func RegisterMergeServer(s grpc.ServiceRegistrar, srv MergeServer) {
 	s.RegisterService(&Merge_ServiceDesc, srv)
+}
+
+func _Merge_Try_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MergeServer).Try(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/mergepb.Merge/Try",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MergeServer).Try(ctx, req.(*TryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _Merge_GetLogs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -127,6 +159,10 @@ var Merge_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "mergepb.Merge",
 	HandlerType: (*MergeServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Try",
+			Handler:    _Merge_Try_Handler,
+		},
 		{
 			MethodName: "GetLogs",
 			Handler:    _Merge_GetLogs_Handler,

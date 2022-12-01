@@ -38,12 +38,22 @@ func (m *merger) Propose(clusters []mergepb.Cluster) (uint64, error) {
 	if clusters == nil || len(clusters) == 0 {
 		return 0, fmt.Errorf("empty clusters")
 	}
+	if len(clusters) != 1 {
+		return 0, fmt.Errorf("current only support merge two clusters")
+	}
 
-	if id, exists := m.ms.getOngoingId(); exists {
+	// check if any merge process is ongoing at this cluster
+	if id, exists := m.ms.getOngoingId(true); exists {
 		return 0, fmt.Errorf("merge process with id %v is ongoning", id)
 	}
 
 	id := m.mergeIdGen.Next()
+
+	// try to start a new merge process on the candidate cluster
+	if err := m.try(id, clusters); err != nil {
+		return 0, err
+	}
+
 	msg := mergepb.MergeMessage{Id: id, Type: mergepb.MergeNew, Clusters: clusters}
 	buf, err := msg.Marshal()
 	if err != nil {
@@ -56,6 +66,52 @@ func (m *merger) Propose(clusters []mergepb.Cluster) (uint64, error) {
 		return 0, err
 	}
 	return id, err
+}
+
+func (m *merger) try(id uint64, clusters []mergepb.Cluster) error {
+	if len(clusters) != 1 {
+		panic("try to merge multiple clusters, not supported")
+	}
+
+	// create clients to one of candidate cluster's nodes
+	clr := clusters[0]
+	clients := make([]*mergepb.MergeClient, 0, len(clr.Nodes))
+	for _, node := range clr.Nodes {
+		target := fmt.Sprintf("%v:%v", node.Ip, node.MergePort)
+		conn, err := grpc.Dial(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			log.Printf("Connect to %v failed, ignore it", target)
+			continue
+		}
+
+		cli := mergepb.NewMergeClient(conn)
+		clients = append(clients, &cli)
+	}
+	if len(clients) == 0 {
+		return fmt.Errorf("cannot connect the candidate cluster")
+	}
+
+	errors := make([]string, 0)
+	for _, ptr := range clients {
+		cli := *ptr
+		resp, err := cli.Try(context.Background(), &mergepb.TryRequest{Id: id, Cluster: clr})
+		if err != nil {
+			log.Printf("Try on candidate cluster failed: %v", err)
+			errors = append(errors, err.Error())
+			continue
+		}
+		if resp.Id != id {
+			err = fmt.Errorf("candidate cluster has an on-going merge with id %v", resp.Id)
+			log.Printf(err.Error())
+			errors = append(errors, err.Error())
+			break
+		}
+
+		log.Printf("Try cluster succeed for merge with id %v", id)
+		return nil
+	}
+
+	return fmt.Errorf("failed start merge process on the candidate cluster: %v", errors)
 }
 
 func (m *merger) readCommit(kvPort uint32, mergeCommitC <-chan *commit, errorC <-chan error) {
@@ -73,6 +129,8 @@ func (m *merger) readCommit(kvPort uint32, mergeCommitC <-chan *commit, errorC <
 				m.handleSquashLog(msg)
 			case mergepb.MergeRefreshed: // on coordinator cluster: merge the refreshed node
 				m.handleRefreshed(msg)
+			case mergepb.MergeTry: // on candidate clusters: try to start a new merge process from coordinator
+				m.handleTry(msg)
 			case mergepb.MergeRedirect: // on candidate clusters: redirect future requests to coordinators
 				url := fmt.Sprintf("http://%v:%v", msg.RedirectIp, msg.RedirectPort)
 				log.Printf("Stop raft and redirect future requests to %v", url)
@@ -88,6 +146,10 @@ func (m *merger) readCommit(kvPort uint32, mergeCommitC <-chan *commit, errorC <
 }
 
 func (m *merger) handleNew(msg mergepb.MergeMessage, kvPort uint32) {
+	if _, ok := m.ms.getOngoingId(false); ok {
+		return // do nothing if there is an ongoing merge process
+	}
+
 	state := mergeState{
 		Clusters:    msg.Clusters,
 		NextIndexes: make([]uint64, len(msg.Clusters)),
@@ -191,6 +253,17 @@ func (m *merger) handleSquashLog(msg mergepb.MergeMessage) {
 	}
 }
 
+func (m *merger) handleTry(msg mergepb.MergeMessage) {
+	if id, ok := m.ms.getOngoingId(false); ok || id == msg.Id {
+		log.Printf("Failed try merge %v, merge %v is ongoing", msg.Id, id)
+		return
+	}
+
+	log.Printf("Someone try to merge this cluster with merge id %v", msg.Id)
+	m.ms.setOngoingId(msg.Id)
+	m.ms.put(msg.Id, mergeState{})
+}
+
 func (m *merger) handleRefreshed(msg mergepb.MergeMessage) {
 	mst, ok := m.ms.get(msg.Id, false)
 	if !ok {
@@ -262,6 +335,8 @@ func (m *merger) startPullingLogs(kvPort uint32, mid uint64, clusters []mergepb.
 					cli := mergepb.NewMergeClient(conn)
 					clients = append(clients, &cli)
 				}
+				// usually the number of successful clients will be the same as nodes in the cluster since
+				// grpc.Dial will not actually dial the remote host and will not fail even if remote host failed
 				if len(clients) != 0 {
 					break
 				}

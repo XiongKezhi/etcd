@@ -153,7 +153,8 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						http.Error(w, fmt.Sprintf("Failed on POST: %v", err), http.StatusBadRequest)
 						return
 					}
-					cluster.Nodes[id] = mergepb.Node{Ip: node.Ip, MergePort: node.MergePort, RaftPort: node.RaftPort}
+					cluster.Nodes[id] = mergepb.Node{Id: id, Ip: node.Ip,
+						MergePort: node.MergePort, RaftPort: node.RaftPort}
 				}
 				clusters = append(clusters, cluster)
 			}

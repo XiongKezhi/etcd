@@ -54,15 +54,16 @@ func main() {
 		newRaftNode(*id, peers, *join, getSnapshot, proposeC, mergeProposeC, confChangeC)
 
 	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
+	ms := NewMergeStore(kvs, proposeC)
 
-	mr := newMerger(rc, NewMergeStore(kvs, proposeC), uint32(*kvport),
+	mr := newMerger(rc, ms, uint32(*kvport),
 		mergeProposeC, confChangeC, mergeCommitC, errorC)
 
 	// the key-value http handler will propose updates to raft
 	serveHttpKVAPI(kvs, mr, *kvport, confChangeC)
 
 	// the merge rpc server will server merge related calls
-	serveRpcMergeAPI(rc, *mergePort, mergeProposeC)
+	serveRpcMergeAPI(rc, ms, kvs.Refresh, *mergePort, mergeProposeC)
 
 	// exit when raft goes down
 	if err, ok := <-errorC; ok {

@@ -23,13 +23,15 @@ enum MergeMessageType {
   MergeNew          = 0;
   MergeSquashLog    = 1;
   MergeRefreshed    = 2;
-  MergeRedirect     = 3;
+  MergeTry          = 3;
+  MergeRedirect     = 4;
 }
 
 message Node {
-  required string Ip 				= 1 [(gogoproto.nullable) = false];
-  required uint32 MergePort	= 2 [(gogoproto.nullable) = false];
-  required uint32 RaftPort 	= 3 [(gogoproto.nullable) = false];
+  required uint64 Id        = 1 [(gogoproto.nullable) = false];
+  required string Ip 				= 2 [(gogoproto.nullable) = false];
+  required uint32 MergePort	= 3 [(gogoproto.nullable) = false];
+  required uint32 RaftPort 	= 4 [(gogoproto.nullable) = false];
 }
 
 message Cluster {
@@ -41,7 +43,7 @@ message MergeMessage {
   required uint64 Id					   = 1 [(gogoproto.nullable) = false]; // id of the merge process
   required MergeMessageType Type = 2 [(gogoproto.nullable) = false];
 
-  // included in MergeNew
+  // included in MergeNew or MergeTry
   repeated Cluster Clusters   = 3 [(gogoproto.nullable) = false];
 
   // included in MergeSquashLog
@@ -57,6 +59,21 @@ message MergeMessage {
   // included in MergeRedirect
   optional string RedirectIp   = 10 [(gogoproto.nullable) = false];
   optional uint32 RedirectPort = 11 [(gogoproto.nullable) = false];
+}
+
+service Merge {
+  rpc Try(TryRequest) returns (TryResponse) {}
+  rpc GetLogs(LogRequest) returns (LogResponse) {}
+  rpc Refresh(RefreshRequest) returns (RefreshResponse) {}
+}
+
+message TryRequest {
+  required uint64 Id       = 1 [(gogoproto.nullable) = false]; // id of the merge process
+  required Cluster Cluster = 2 [(gogoproto.nullable) = false]; // candidate cluster information
+}
+
+message TryResponse {
+  required uint64 Id = 1 [(gogoproto.nullable) = false]; // id of the ongoing merge id if exists, or the requested id
 }
 
 message LogRequest {
@@ -78,8 +95,3 @@ message RefreshRequest {
 }
 
 message RefreshResponse {}
-
-service Merge {
-  rpc GetLogs(LogRequest) returns (LogResponse) {}
-  rpc Refresh(RefreshRequest) returns (RefreshResponse) {}
-}

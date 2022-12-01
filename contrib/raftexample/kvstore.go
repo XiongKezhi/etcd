@@ -84,6 +84,12 @@ func (s *kvstore) Propose(k string, v string, wait bool) error {
 	}
 }
 
+func (s *kvstore) Refresh() {
+	s.mu.Lock()
+	s.kvStore = make(map[string]string)
+	s.mu.Unlock()
+}
+
 func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 	for commit := range commitC {
 		if commit == nil {

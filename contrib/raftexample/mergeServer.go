@@ -16,19 +16,21 @@ import (
 
 type mergeServer struct {
 	rc            *raftNode
+	ms            *mergeStore
+	refreshKv     func()
 	mergeProposeC chan<- proposal
 	mergepb.UnimplementedMergeServer
 }
 
 // serveRpcMergeAPI starts a merge server to server RPC calls.
-func serveRpcMergeAPI(rc *raftNode, mergePort int, mergeProposeC chan<- proposal) {
+func serveRpcMergeAPI(rc *raftNode, ms *mergeStore, refreshKv func(), mergePort int, mergeProposeC chan<- proposal) {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", mergePort))
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
 	srv := grpc.NewServer()
-	mergepb.RegisterMergeServer(srv, &mergeServer{rc: rc, mergeProposeC: mergeProposeC})
+	mergepb.RegisterMergeServer(srv, &mergeServer{rc: rc, ms: ms, refreshKv: refreshKv, mergeProposeC: mergeProposeC})
 	if err := srv.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
@@ -36,6 +38,55 @@ func serveRpcMergeAPI(rc *raftNode, mergePort int, mergeProposeC chan<- proposal
 
 const batchSize = 128                // number of logs in one batch
 const maxSize = 18446744073709551615 // max size in bytes
+
+func (m *mergeServer) Try(ctx context.Context, in *mergepb.TryRequest) (*mergepb.TryResponse, error) {
+	log.Printf("Received request to start merge with id %v", in.Id)
+
+	// check if already has an ongoing one
+	if id, ok := m.ms.getOngoingId(true); ok {
+		log.Printf("Try new merge failed due to ongoing merge with id %v", in.Id)
+		return &mergepb.TryResponse{Id: id}, nil
+	}
+
+	// check if request cluster information is the same to the cluster config
+	if len(in.Cluster.Nodes) != len(m.rc.confState.Voters) {
+		log.Printf("Cluster configuration not match")
+		return &mergepb.TryResponse{}, fmt.Errorf("cluster configuration not match")
+	}
+	conf := make(map[uint64]struct{})
+	for _, vid := range m.rc.confState.Voters {
+		conf[vid] = struct{}{}
+	}
+	for _, node := range in.Cluster.Nodes {
+		if _, ok := conf[node.Id]; !ok {
+			log.Printf("Cluster configuration not match")
+			return &mergepb.TryResponse{}, fmt.Errorf("cluster configuration not match")
+		}
+	}
+
+	// try a new one
+	msg := mergepb.MergeMessage{Id: in.Id, Type: mergepb.MergeTry}
+	msgBytes, err := msg.Marshal()
+	if err != nil {
+		return &mergepb.TryResponse{}, err
+	}
+
+	wc := make(chan error)
+	m.mergeProposeC <- proposal{Message: string(msgBytes), wait: wc}
+	if err := <-wc; err != nil && !errors.Is(err, raft.ErrStopped) {
+		log.Printf("Try new merge failed: %v", err)
+		return &mergepb.TryResponse{}, fmt.Errorf("try ner merge error: %v", err)
+	}
+
+	// retrieve ongoing id
+	id, ok := m.ms.getOngoingId(true)
+	if !ok {
+		return &mergepb.TryResponse{Id: id}, fmt.Errorf("no merge id successfully tried")
+	}
+
+	log.Printf("Try cluster succeed for merge with id %v", id)
+	return &mergepb.TryResponse{Id: id}, nil
+}
 
 func (m *mergeServer) GetLogs(ctx context.Context, in *mergepb.LogRequest) (*mergepb.LogResponse, error) {
 	log.Printf("Received request for log starting from %v", in.Index)
@@ -60,7 +111,7 @@ func (m *mergeServer) GetLogs(ctx context.Context, in *mergepb.LogRequest) (*mer
 		}
 
 		log.Printf("Fetch entries failed: %v", err)
-		return nil, err
+		return &mergepb.LogResponse{}, err
 	}
 
 	// retrieve data from normal entries
@@ -89,7 +140,7 @@ func (m *mergeServer) GetLogs(ctx context.Context, in *mergepb.LogRequest) (*mer
 	msg := mergepb.MergeMessage{Id: in.Id, Type: mergepb.MergeRedirect, RedirectIp: ip, RedirectPort: in.KvPort}
 	msgBytes, err := msg.Marshal()
 	if err != nil {
-		return nil, err
+		return &mergepb.LogResponse{}, err
 	}
 
 	// propose and wait on commit and apply
@@ -97,7 +148,7 @@ func (m *mergeServer) GetLogs(ctx context.Context, in *mergepb.LogRequest) (*mer
 	m.mergeProposeC <- proposal{Message: string(msgBytes), wait: wc}
 	if err := <-wc; err != nil && !errors.Is(err, raft.ErrStopped) {
 		log.Printf("Propose last batch failed: %v", err)
-		return nil, fmt.Errorf("propose last batch error: %v", err)
+		return &mergepb.LogResponse{}, fmt.Errorf("propose last batch error: %v", err)
 	}
 
 	log.Printf("Responded with %v log entries in the last batch", len(data))
@@ -112,8 +163,9 @@ func (m *mergeServer) Refresh(ctx context.Context, in *mergepb.RefreshRequest) (
 		peers[int(k)] = v
 	}
 	if err := m.rc.refresh(peers); err != nil {
-		return nil, err
+		return &mergepb.RefreshResponse{}, err
 	}
 
+	m.refreshKv()
 	return &mergepb.RefreshResponse{}, nil
 }
