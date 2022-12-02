@@ -36,7 +36,7 @@ func serveRpcMergeAPI(rc *raftNode, ms *mergeStore, refreshKv func(), mergePort 
 	}
 }
 
-const batchSize = 128                // number of logs in one batch
+var batchSize = 128                  // number of logs in one batch
 const maxSize = 18446744073709551615 // max size in bytes
 
 func (m *mergeServer) Try(ctx context.Context, in *mergepb.TryRequest) (*mergepb.TryResponse, error) {

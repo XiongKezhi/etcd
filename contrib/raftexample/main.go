@@ -28,7 +28,9 @@ func main() {
 	kvport := flag.Int("port", 9121, "key-value server port")
 	mergePort := flag.Int("mergeport", 9122, "merge server port")
 	join := flag.Bool("join", false, "join an existing cluster")
+	pullBatchSize := flag.Int("pullBatchSize", 100, "batch size when logs are pulled for merge")
 	flag.Parse()
+	batchSize = *pullBatchSize
 
 	peers := make(map[int]string)
 	for _, p := range strings.Split(*cluster, ",") {
